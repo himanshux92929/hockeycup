@@ -1,0 +1,15 @@
+services:
+  - type: web
+    name: m3u8proxy
+    runtime: python
+    plan: free
+    buildCommand: pip install -r requirements.txt
+    startCommand: python main.py
+    envVars:
+      - key: PROXY_SECRET
+        value: SUPERM3U8          # ← change this to your own secret
+      - key: RENDER_EXTERNAL_URL
+        fromService:
+          type: web
+          name: m3u8proxy
+          property: host          # auto-filled by Render
