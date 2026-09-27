@@ -5,30 +5,25 @@ import base64
 import asyncio
 import hashlib
 import base64 as _b64
-from urllib.parse import urljoin, urlparse, urlunparse
+from urllib.parse import urljoin, urlparse, urlencode, parse_qs
 
 from cryptography.fernet import Fernet
-import curl_cffi.requests as curl_requests
+from curl_cffi import requests as cffi_requests   # ← exact import from your snippet
 from fastapi import FastAPI, Request, Response
 from fastapi.responses import HTMLResponse
 import uvicorn
 
-# ── Config ───────────────────────────────────────────────────────────────────
+# ── Config ────────────────────────────────────────────────────────────────────
 SECRET_KEY = os.environ.get("PROXY_SECRET", "SUPERM3U8")
 APP_URL    = os.environ.get("RENDER_EXTERNAL_URL", "http://localhost:8000").rstrip("/")
 
-# Fernet key derived from secret (stable, deterministic)
 _raw   = hashlib.sha256(SECRET_KEY.encode()).digest()
 FERNET = Fernet(_b64.urlsafe_b64encode(_raw))
 
 # ── Allowed hosts ─────────────────────────────────────────────────────────────
-# Edit this list to restrict access.
-# Use ["*"] to allow everyone (default).
-# Example: ["mysite.com", "192.168.1.10", "localhost"]
-ALLOWED_HOSTS: list[str] = json.loads(
-    os.environ.get("ALLOWED_HOSTS", '["*"]')
-)
-_ALLOW_ALL = "*" in ALLOWED_HOSTS
+# JSON array env var.  ["*"] = allow all.  ["mysite.com","other.io"] = restrict.
+ALLOWED_HOSTS: list = json.loads(os.environ.get("ALLOWED_HOSTS", '["*"]'))
+_ALLOW_ALL   = "*" in ALLOWED_HOSTS
 _ALLOWED_SET = {h.lower() for h in ALLOWED_HOSTS}
 
 _BLOCKED_HTML = (
@@ -44,21 +39,18 @@ _BLOCKED_HTML = (
     "</div></body></html>"
 )
 
-def _get_origin_host(request: Request) -> str:
-    """Return the requesting host, preferring Origin header over Host."""
+def _origin_host(request: Request) -> str:
     origin = request.headers.get("origin", "")
     if origin:
         return urlparse(origin).hostname or ""
-    host = request.headers.get("host", "")
-    return host.split(":")[0].lower()
+    return request.headers.get("host", "").split(":")[0].lower()
 
 def _is_allowed(request: Request) -> bool:
     if _ALLOW_ALL:
         return True
-    host = _get_origin_host(request)
-    return host in _ALLOWED_SET
+    return _origin_host(request) in _ALLOWED_SET
 
-# ── Crypto helpers ────────────────────────────────────────────────────────────
+# ── Crypto ────────────────────────────────────────────────────────────────────
 def encrypt_url(url: str) -> str:
     token = FERNET.encrypt(url.encode()).decode()
     return base64.urlsafe_b64encode(token.encode()).decode().rstrip("=")
@@ -70,24 +62,48 @@ def decrypt_token(token: str) -> str:
     raw = base64.urlsafe_b64decode(token.encode()).decode()
     return FERNET.decrypt(raw.encode()).decode()
 
-# ── curl_cffi (persistent session, Chrome 110 TLS fingerprint) ───────────────
-SESSION = curl_requests.Session(impersonate="chrome110")
-
-CURL_HEADERS = {
-    "sec-ch-ua-platform": '"Windows"',
+# ── curl_cffi fetch ───────────────────────────────────────────────────────────
+# Using the exact same pattern as your reference snippet:
+#   from curl_cffi import requests as cffi_requests
+#   cffi_requests.get(url, params=..., headers=..., impersonate="edge101")
+#
+# Headers mirror your working curl command (Edge 153 / Chromium 153).
+_HEADERS = {
     "Referer": "https://vidcloud.eu.org/",
+    "sec-ch-ua-platform": '"Windows"',
+    "sec-ch-ua": '"Microsoft Edge";v="153", "Not_A Brand";v="8", "Chromium";v="153"',
+    "sec-ch-ua-mobile": "?0",
     "User-Agent": (
         "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
         "AppleWebKit/537.36 (KHTML, like Gecko) "
-        "Chrome/154.0.0.0 Safari/537.36 Edg/154.0.0.0"
+        "Chrome/153.0.0.0 Safari/537.36 Edg/153.0.0.0"
     ),
-    "sec-ch-ua": '"Chromium";v="154", "Microsoft Edge";v="154", "Not A(Brand";v="99"',
-    "sec-ch-ua-mobile": "?0",
     "Range": "bytes=0-",
 }
 
-def _fetch(url: str) -> curl_requests.Response:
-    return SESSION.get(url, headers=CURL_HEADERS, timeout=20, allow_redirects=True)
+def _fetch(url: str) -> cffi_requests.Response:
+    """
+    Split the URL into base + params dict so curl_cffi handles
+    query-string encoding exactly like your reference snippet does.
+    Impersonate Edge 101 (same JA3/JA4 fingerprint as Edge 153 UA).
+    """
+    # Parse out any existing query string into a params dict
+    # so curl_cffi re-encodes them correctly (preserves special chars)
+    from urllib.parse import urlsplit, urlunsplit
+    parts  = urlsplit(url)
+    params = parse_qs(parts.query, keep_blank_values=True)
+    # parse_qs returns lists; flatten to single values
+    flat_params = {k: v[0] if len(v) == 1 else v for k, v in params.items()}
+    clean_url   = urlunsplit((parts.scheme, parts.netloc, parts.path, "", ""))
+
+    return cffi_requests.get(
+        clean_url,
+        params=flat_params if flat_params else None,
+        headers=_HEADERS,
+        impersonate="edge101",   # ← TLS fingerprint: Edge 101
+        timeout=20,
+        allow_redirects=True,
+    )
 
 # ── M3U8 rewriting ────────────────────────────────────────────────────────────
 _URI_RE = re.compile(r'(URI=")([^"]+)(")')
@@ -106,7 +122,9 @@ def _rewrite_m3u8(content: str, base_url: str) -> str:
         s = line.strip()
         if "URI=" in line:
             line = _URI_RE.sub(
-                lambda m: m.group(1) + _proxy(_resolve(m.group(2), base_url)) + m.group(3),
+                lambda m: m.group(1)
+                    + _proxy(_resolve(m.group(2), base_url))
+                    + m.group(3),
                 line,
             )
             out.append(line)
@@ -126,7 +144,7 @@ def _is_m3u8(ct: str, head: bytes) -> bool:
 # ── FastAPI ───────────────────────────────────────────────────────────────────
 app = FastAPI(docs_url=None, redoc_url=None, openapi_url=None)
 
-# Always-present CORS headers (even on blocked responses — looks like a normal CDN)
+# Always send CORS — even on 403 — so clients see no difference
 _CORS = {
     "Access-Control-Allow-Origin": "*",
     "Access-Control-Allow-Methods": "GET, OPTIONS",
@@ -134,46 +152,46 @@ _CORS = {
 }
 
 @app.options("/{path:path}")
-async def options_handler(request: Request):
+async def options_preflight(request: Request):
     return Response(status_code=204, headers=_CORS)
 
 @app.get("/health")
 async def health():
-    return Response(content='{"status":"ok"}', media_type="application/json", headers=_CORS)
+    return Response('{"status":"ok"}', media_type="application/json", headers=_CORS)
 
 @app.get("/{token:path}")
 async def proxy(token: str, request: Request):
-    # ── Host check (silent 403, looks like a generic block page) ──
+    # ── 1. Host gate ──────────────────────────────────────────────────────────
     if not _is_allowed(request):
-        return HTMLResponse(
-            content=_BLOCKED_HTML,
-            status_code=403,
-            headers={**_CORS},   # still send CORS so origin doesn't see a CORS error
-        )
+        return HTMLResponse(_BLOCKED_HTML, status_code=403, headers=_CORS)
 
     token = token.lstrip("/")
     if not token:
         return HTMLResponse(_BLOCKED_HTML, status_code=403, headers=_CORS)
 
+    # ── 2. Decrypt token → real URL ───────────────────────────────────────────
     try:
         target_url = decrypt_token(token)
     except Exception:
         return HTMLResponse(_BLOCKED_HTML, status_code=403, headers=_CORS)
 
-    # Append any extra query params the player added
+    # Append any extra query params the player appended to our proxy URL
     qs = str(request.query_params)
     if qs:
         sep = "&" if "?" in target_url else "?"
-        target_url = target_url + sep + qs
+        target_url += sep + qs
 
+    # ── 3. Fetch via curl_cffi (runs in thread — keeps event loop free) ───────
+    loop = asyncio.get_event_loop()
     try:
-        resp = await asyncio.get_event_loop().run_in_executor(None, _fetch, target_url)
+        resp = await loop.run_in_executor(None, _fetch, target_url)
     except Exception as e:
         return Response(f"upstream error: {e}", status_code=502, headers=_CORS)
 
     ct   = resp.headers.get("content-type", "")
     body = resp.content
 
+    # ── 4. M3U8 → rewrite; everything else → pass-through ────────────────────
     if _is_m3u8(ct, body[:16]):
         rewritten = _rewrite_m3u8(body.decode("utf-8", errors="replace"), target_url)
         return Response(
@@ -182,16 +200,16 @@ async def proxy(token: str, request: Request):
             headers={**_CORS, "Cache-Control": "no-cache, no-store"},
         )
 
-    headers = {
+    out_headers = {
         **_CORS,
         "Content-Type": ct or "application/octet-stream",
         "Cache-Control": resp.headers.get("Cache-Control", "public, max-age=3600"),
     }
     for h in ("Content-Length", "Content-Range"):
         if h in resp.headers:
-            headers[h] = resp.headers[h]
+            out_headers[h] = resp.headers[h]
 
-    return Response(content=body, status_code=resp.status_code, headers=headers)
+    return Response(content=body, status_code=resp.status_code, headers=out_headers)
 
 # ── Entry ─────────────────────────────────────────────────────────────────────
 if __name__ == "__main__":
